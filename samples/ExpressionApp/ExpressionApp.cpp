@@ -34,6 +34,7 @@
 #include "nvCVOpenCV.h"
 #include "opencv2/opencv.hpp"
 #include "MeshRenderer.h"
+#include "json.hpp"
 
 #ifdef _WIN32
   #ifndef WIN32_LEAN_AND_MEAN
@@ -41,6 +42,9 @@
   #endif // WIN32_LEAN_AND_MEAN
   #include <Windows.h>
   #define strcasecmp _stricmp
+
+    #include <winsock2.h>
+    #pragma comment (lib, "Ws2_32.lib")
 #else
   #include <sys/stat.h>
 #endif // _WIN32
@@ -94,7 +98,8 @@ bool
     FLAG_debug              = false,
     FLAG_loop               = false,
     FLAG_show               = false,
-    FLAG_showUI             = false,
+    FLAG_showUI             = true,
+    FLAG_liveStream         = true,
     FLAG_verbose            = false;
 std::string
     FLAG_camRes,
@@ -116,7 +121,8 @@ int
     FLAG_exprMode           = 2,                  // 1=mesh, 2=MLP
     FLAG_poseMode           = 0,
     FLAG_cheekPuff          = 0,
-    FLAG_gaze               = 0;
+    FLAG_gaze               = 0,
+    FLAG_imageRotate = -1;
 double
     FLAG_fov                = 0.0;                // Orthographic by default
 
@@ -142,7 +148,8 @@ static void Usage() {
       " --gaze=<number>             specify gaze estimation mode 0=implicit, 1=explicit (default 0)\n"
       " --fov=<degrees>             field of view, in degrees; 0 implies orthographic (default 0)\n"
       " --help                      print this message\n"
-      " --in=<file>                 specify the input file (default webcam 0)\n"
+      " --in=<file>                 specify the input file path or numerical index for webcam (default webcam 0)\n"
+      " --rotate=<mode>             specify the input image pre rotation (mode 0 for 90 clockwise, 1 for 180, 2 for 90 counterclockwise\n"
       " --loop[=(true|false)]       play the same video repeatedly\n"
       " --model_dir=<path>          specify the directory containing the TRT models\n"
       " --model_path=<path>         specify the directory containing the TRT models\n"
@@ -276,6 +283,7 @@ static int ParseMyArgs(int argc, char **argv) {
       GetFlagArgVal("face_model",   arg, &FLAG_fitModel)      ||
       GetFlagArgVal("filter",       arg, &FLAG_filter)        ||
       GetFlagArgVal("gaze",         arg, &FLAG_gaze)          ||
+        GetFlagArgVal("rotate", arg, &FLAG_imageRotate) ||
       GetFlagArgVal("fov",          arg, &FLAG_fov)           ||
       GetFlagArgVal("in",           arg, &FLAG_inFile)        ||
       GetFlagArgVal("in_file",      arg, &FLAG_inFile)        ||
@@ -405,6 +413,7 @@ public:
   };
   CUstream          _stream = 0;
   cv::Mat           _ocvSrcImg, _ocvDstImg; // _ocvSrcImg is allocated, _ocvDstImg is just a wrapper
+  cv::Mat           _ocvSrcImg90; // in case we have to rotate webcam input by 90 degrees, we have swapped width x height
   cv::VideoCapture  _vidIn{};
   cv::VideoWriter   _vidOut{};
   double            _frameRate;
@@ -412,7 +421,7 @@ public:
   NvAR_FaceMesh     _arMesh { nullptr, 0, nullptr, 0 };
   NvAR_FeatureHandle _featureHan{};
   NvAR_RenderingParams _renderParams;
-  NvCVImage         _srcImg, _compImg, _srcGpu, _renderImg; // wrapper, alloced, alloced, alloced
+  NvCVImage         _srcImg, _srcImg90, _compImg, _srcGpu, _renderImg; // wrapper, alloced, alloced, alloced
   Pose              _pose;
   float             _cameraIntrinsicParams[NUM_CAMERA_INTRINSIC_PARAMS];
   std::string       _inFile, _outFile;
@@ -477,7 +486,24 @@ public:
     APP_ERR_ARG_PARSE,
     APP_ERR_EOF
   };
+
+  static const int PORT;
+  static const char* ADDRESS;
+
+private:
+	sockaddr_in _server;
+	int _clientSocket;
+
+    int InitializeWinSocks();
+    void SendExpressions();
+
+    bool Is90DegreeRotated();
+    void SwapVideoDimentions();
 };
+
+const int App::PORT = 14448;
+const char* App::ADDRESS = "127.0.0.1";
+
 const char App::_windowTitle[] = "Expression App";
 const char *App::_exprAbbr[][4] = {
   { "BROW", "DOWN", "LEFT", NULL    },    // 0  browDown_L
@@ -522,7 +548,7 @@ const char *App::_exprAbbr[][4] = {
   { "MOUT", "PUKR", NULL,   NULL    },    // 39 mouthPucker
   { "MOUT", "RIGHT",NULL,   NULL    },    // 40 mouthRight
   { "MOUT", "ROLL", "LOWR", NULL    },    // 41 mouthRollLower
-  { "MOUT", "ROLL", "UPPR", NULL    },    // 41 mouthRollUpper
+  { "MOUT", "ROLL", "UPPR", NULL    },    // 42 mouthRollUpper
   { "MOUT", "SHRG", "LOWR", NULL    },    // 43 mouthShrugLower
   { "MOUT", "SHRG", "UPPR", NULL    },    // 44 mouthShrugUpper
   { "MOUT", "SMIL", "LEFT", NULL    },    // 45 mouthSmile_L
@@ -543,12 +569,154 @@ const char *App::_sfmExprAbbr[][4] = {
   { "SURPRISE", NULL, NULL, NULL    },
 };
 
+bool App::Is90DegreeRotated()
+{
+    return (FLAG_imageRotate == cv::ROTATE_90_CLOCKWISE || FLAG_imageRotate == cv::ROTATE_90_COUNTERCLOCKWISE);
+}
+
+void App::SwapVideoDimentions()
+{
+	if (Is90DegreeRotated())
+	{
+		int temp = _videoWidth;
+		_videoWidth = _videoHeight;
+		_videoHeight = temp;
+	}
+}
+
+int App::InitializeWinSocks()
+{
+	WSADATA wsaData;
+	int result;
+
+	// Initialize Winsock
+	result = WSAStartup(MAKEWORD(2, 2), &wsaData);
+	if (result != 0) {
+		printf("WSAStartup failed with error: %d\n", result);
+		return NVCV_ERR_GENERAL;
+	}
+
+	// create socket
+
+	if ((_clientSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == SOCKET_ERROR) // <<< UDP socket
+	{
+		printf("socket() failed with error code: %d", WSAGetLastError());
+		return NVCV_ERR_GENERAL;
+	}
+
+	// setup address structure
+	memset((char*)&_server, 0, sizeof(_server));
+	_server.sin_family = AF_INET;
+	_server.sin_port = htons(PORT);
+	_server.sin_addr.S_un.S_addr = inet_addr(ADDRESS);
+
+    return NVCV_SUCCESS;
+}
+
+void App::SendExpressions()
+{
+	using json = nlohmann::json;
+	static json default_rotation = {
+		{"X", 0.0f}, {"Y", 0.0f}, {"Z", 0.0f}, {"W", 1.0f}, {"IsIdentity", true}
+	};
+
+	constexpr float SCALE{ 100.0f };
+
+	json frameData = {
+		{"UserProductID", "NV Face Expression"},
+		{"TimeStamp", 0.0},
+		{"eyeBlinkLeft", SCALE * _expressions[10]},
+		{"eyeLookDownLeft", SCALE * _expressions[12]},
+		{"eyeLookInLeft", SCALE * _expressions[14]},
+		{"eyeLookOutLeft", SCALE * _expressions[16]},
+		{"eyeLookUpLeft", SCALE * _expressions[18]},
+		{"eyeSquintLeft", SCALE * _expressions[20]},
+		{"eyeWideLeft", SCALE * _expressions[22]},
+		{"eyeBlinkRight", SCALE * _expressions[11]},
+		{"eyeLookDownRight", SCALE * _expressions[13]},
+		{"eyeLookInRight", SCALE * _expressions[15]},
+		{"eyeLookOutRight", SCALE * _expressions[17]},
+		{"eyeLookUpRight", SCALE * _expressions[19]},
+		{"eyeSquintRight", SCALE * _expressions[21]},
+		{"eyeWideRight", SCALE * _expressions[23]},
+		{"jawForward", SCALE * _expressions[24]},
+		{"jawLeft", SCALE * _expressions[25]},
+		{"jawRight", SCALE * _expressions[27]},
+		{"jawOpen", SCALE * _expressions[26]},
+		{"mouthClose", SCALE * _expressions[28]},
+		{"mouthFunnel", SCALE * _expressions[33]},
+		{"mouthPucker", SCALE * _expressions[39]},
+		{"mouthLeft", SCALE * _expressions[34]},
+		{"mouthRight", SCALE * _expressions[40]},
+		{"mouthSmileLeft", SCALE * _expressions[45]},
+		{"mouthSmileRight", SCALE * _expressions[46]},
+		{"mouthFrownLeft", SCALE * _expressions[31]},
+		{"mouthFrownRight", SCALE * _expressions[32]},
+		{"mouthDimpleLeft", SCALE * _expressions[29]},
+		{"mouthDimpleRight", SCALE * _expressions[30]},
+		{"mouthStretchLeft", SCALE * _expressions[47]},
+		{"mouthStretchRight", SCALE * _expressions[48]},
+		{"mouthRollLower", SCALE * _expressions[41]},
+		{"mouthRollUpper", SCALE * _expressions[42]},
+		{"mouthShrugLower", SCALE * _expressions[43]},
+		{"mouthShrugUpper", SCALE * _expressions[44]},
+		{"mouthPressLeft", SCALE * _expressions[37]},
+		{"mouthPressRight", SCALE * _expressions[38]},
+		{"mouthLowerDownLeft", SCALE * _expressions[35]},
+		{"mouthLowerDownRight", SCALE * _expressions[36]},
+		{"mouthUpperUpLeft", SCALE * _expressions[49]},
+		{"mouthUpperUpRight", SCALE * _expressions[50]},
+		{"browDownLeft", SCALE * _expressions[0]},
+		{"browDownRight", SCALE * _expressions[1]},
+		{"browInnerUp", SCALE * (_expressions[2] + _expressions[3]) * 0.5f},
+		{"browOuterUpLeft", SCALE * _expressions[4]},
+		{"browOuterUpRight", SCALE * _expressions[5]},
+		{"cheekPuff", SCALE * (_expressions[6] + _expressions[7]) * 0.5f},
+		{"cheekSquintLeft", SCALE * _expressions[8]},
+		{"cheekSquintRight", SCALE * _expressions[9]},
+		{"noseSneerLeft", SCALE * _expressions[51]},
+		{"noseSneerRight", SCALE * _expressions[52]},
+		{"tongueOut", 0.0},
+		{"headRotation", default_rotation },
+		{"eyeRotations", json::array({default_rotation, default_rotation})}
+	};
+
+	const std::string payloadText = frameData.dump(-1, ' ', true);
+	static std::vector<char> payload(payloadText.size());
+
+	if (payload.size() < payloadText.size())
+		payload.resize((payloadText.size() + 1));
+	std::fill(begin(payload), end(payload), 0);
+
+	for (int i = 0, count = static_cast<int>(payloadText.size()); i < count; ++i)
+	{
+		payload[i] = payloadText[i];
+	}
+
+	json remote_api_message = {
+		{"intent", 8},
+		{"payloadType", 1},
+		//{"messageType", {"type", "None"}},
+		{"payload", payload},
+		{"timestamp", (long)0}
+	};
+
+	const std::string msg = remote_api_message.dump(-1, ' ', true);
+
+	// send the message
+	if (sendto(_clientSocket, msg.c_str(), msg.size(), 0, (sockaddr*)&_server, sizeof(sockaddr_in)) == SOCKET_ERROR)
+	{
+		printf("sendto() failed with error code: %d", WSAGetLastError());
+	}
+}
+
 NvCV_Status App::setInputVideo(const std::string& file) {
   // opencv2/vidioio.hpp
   if (!_vidIn.open(file)) return (NvCV_Status)APP_ERR_OPEN;
   _frameRate   = _vidIn.get(CV_CAP_PROP_FPS);
   _videoWidth  = (unsigned)_vidIn.get(CV_CAP_PROP_FRAME_WIDTH);
   _videoHeight = (unsigned)_vidIn.get(CV_CAP_PROP_FRAME_HEIGHT);
+  SwapVideoDimentions();
   if (FLAG_verbose)
     printf("Video capture resolution set to %dx%d @ %4.1f fps\n", _videoWidth, _videoHeight, _frameRate);
   _inFile = file;
@@ -580,6 +748,7 @@ NvCV_Status App::setInputCamera(int index, const std::string& resStr) {
   }
   _videoWidth  = (unsigned)_vidIn.get(CV_CAP_PROP_FRAME_WIDTH);
   _videoHeight = (unsigned)_vidIn.get(CV_CAP_PROP_FRAME_HEIGHT);
+  SwapVideoDimentions();
   _frameRate = _vidIn.get(CV_CAP_PROP_FPS);
   // Rounding the frame rate is required because OpenCV does not support all frame rates when writing video
   static const int fps_precision = 1000;
@@ -902,7 +1071,17 @@ NvCV_Status App::init() {
   }
 
   BAIL_IF_ERR(err = NvCVImage_Alloc(&_srcGpu,    _videoWidth,   _videoHeight, NVCV_BGR,  NVCV_U8, NVCV_CHUNKY, NVCV_GPU, 1));
-  BAIL_IF_ERR(err = NvCVImage_Alloc(&_srcImg,    _videoWidth,   _videoHeight, NVCV_BGR,  NVCV_U8, NVCV_CHUNKY, NVCV_CPU_PINNED, 0));
+  
+  if (!Is90DegreeRotated())
+  {
+      BAIL_IF_ERR(err = NvCVImage_Alloc(&_srcImg, _videoWidth, _videoHeight, NVCV_BGR, NVCV_U8, NVCV_CHUNKY, NVCV_CPU_PINNED, 0));
+  }
+  else
+  {
+      BAIL_IF_ERR(err = NvCVImage_Alloc(&_srcImg, _videoHeight, _videoWidth, NVCV_BGR, NVCV_U8, NVCV_CHUNKY, NVCV_CPU_PINNED, 0));
+      BAIL_IF_ERR(err = NvCVImage_Alloc(&_srcImg90, _videoWidth, _videoHeight, NVCV_BGR, NVCV_U8, NVCV_CHUNKY, NVCV_CPU_PINNED, 0));
+      CVWrapperForNvCVImage(&_srcImg90, &_ocvSrcImg90);
+  }
   BAIL_IF_ERR(err = NvCVImage_Alloc(&_compImg,   _compWidth,   _compHeight,   NVCV_BGR,  NVCV_U8, NVCV_CHUNKY, NVCV_CPU, 0));
   BAIL_IF_ERR(err = NvCVImage_Alloc(&_renderImg, _renderWidth, _renderHeight, NVCV_RGBA, NVCV_U8, NVCV_CHUNKY, NVCV_CPU, 0));
   CVWrapperForNvCVImage(&_compImg, &_ocvDstImg);
@@ -937,6 +1116,12 @@ NvCV_Status App::init() {
     ui_obj_.init(_exprCount, _filtering, FLAG_exprMode, _viewMode, _showFPS);
 #endif  // _ENABLE_UI
 
+  // stream via UDP
+  if (FLAG_liveStream)
+  {
+      InitializeWinSocks();
+  }
+  
 bail:
   return err;
 }
@@ -966,7 +1151,10 @@ NvCV_Status App::run() {
       --frameCount;                                         // Account for the wasted frame
       continue;                                             // Read the first frame again
     }
-
+    if (Is90DegreeRotated())
+    {
+        cv::rotate(_ocvSrcImg, _ocvSrcImg90, (cv::RotateFlags) FLAG_imageRotate);
+    }
 #ifdef _ENABLE_UI
     unsigned int exprMode = 0;
     bool uncalibrate = false;
@@ -1022,8 +1210,8 @@ NvCV_Status App::run() {
       }
     }
 #endif  // _ENABLE_UI
-
-    BAIL_IF_ERR(err = NvCVImage_Transfer(&_srcImg, &_srcGpu, 1.f, _stream, nullptr));
+    NvCVImage* inputImage = (Is90DegreeRotated()) ? &_srcImg90 : &_srcImg;
+    BAIL_IF_ERR(err = NvCVImage_Transfer(inputImage, &_srcGpu, 1.f, _stream, nullptr));
     BAIL_IF_ERR(err = NvAR_Run(_featureHan));
     unsigned isFaceDetected = (_outputBboxes.num_boxes > 0) ? 0xFF : 0;
     if (_cameraNeedsUpdate) {
@@ -1038,11 +1226,11 @@ NvCV_Status App::run() {
     }
     normalizeExpressionsWeights();
     if (_viewMode & VIEW_LM & isFaceDetected) {
-      BAIL_IF_ERR(err = overlayLandmarks(&_landmarks.data()->x, _renderHeight, &_srcImg));
+      BAIL_IF_ERR(err = overlayLandmarks(&_landmarks.data()->x, _renderHeight, inputImage));
     }
     if (_viewMode & VIEW_IMAGE) {
       NvCVImage_InitView(&view, &_compImg, _miniX, _miniY, _miniWidth, _miniHeight);
-      err = ResizeNvCVImage(&_srcImg, &view);
+      err = ResizeNvCVImage(inputImage, &view);
     }
     if (_viewMode & VIEW_PLOT) {
       if (!isFaceDetected)  std::fill(_expressions.begin(), _expressions.end(), 0);
@@ -1077,6 +1265,13 @@ NvCV_Status App::run() {
       ui_obj_.stateSetbyCore(_expressions, _expressionZeroPoint, _expressionScale, _expressionExponent, (uncalibrate || calibrate), key);
     }
 #endif  // _ENABLE_UI
+
+    // stream expressions via UDP
+    if (FLAG_liveStream)
+    {
+        SendExpressions();
+    }
+    
     if (!FLAG_showUI) {
       switch (key) {
       case 27 /*ESC*/:
@@ -1297,14 +1492,19 @@ int main(int argc, char **argv) {
   }
 
 
-  if (!FLAG_inFile.empty()) {                 // Input from a video file
+  if (!FLAG_inFile.empty() && FileExists(FLAG_inFile)) {                 // Input from a video file
     err = app.setInputVideo(FLAG_inFile);
     if (NVCV_SUCCESS != err) {
       printf("ERROR: \"%s\": %s\n", FLAG_inFile.c_str(), app.getErrorStringFromCode(err));
       goto bail;
     }
   } else {                                    // Input from a webcam, #0
-    err = app.setInputCamera(0, FLAG_camRes);
+      int index = 0;
+      if (!FLAG_inFile.empty())
+      {
+          sscanf_s(FLAG_inFile.c_str(), "%d", &index);
+      }
+    err = app.setInputCamera(index, FLAG_camRes);
     if (NVCV_SUCCESS != err) {
       printf("ERROR: cam0: %s\n", app.getErrorStringFromCode(err));
       goto bail;
